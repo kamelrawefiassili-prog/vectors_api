@@ -5,12 +5,7 @@ from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from typing import List
 
-# تخصيص مسارات التوثيق لتكون متوافقة مع توجيه Vercel
-app = FastAPI(
-    title="Visual Search API",
-    docs_url="/api/docs",
-    openapi_url="/api/openapi.json"
-)
+app = FastAPI(title="Visual Search API")
 
 @app.get("/")
 @app.get("/api")
@@ -26,7 +21,6 @@ JINA_URL = "https://api.jina.ai/v1/embeddings"
 DB_INDEX = []
 
 def get_jina_embedding(image_input: dict) -> List[float]:
-    """استخراج المتجه البصري من Jina AI عبر رابط أو صورة"""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {JINA_API_KEY}"
@@ -44,6 +38,7 @@ class IndexRequest(BaseModel):
     product_id: str
     image_urls: List[str]
 
+@app.post("/index-product")
 @app.post("/api/index-product")
 async def index_product(req: IndexRequest):
     global DB_INDEX
@@ -64,6 +59,7 @@ async def index_product(req: IndexRequest):
             
     return {"status": "success", "product_id": req.product_id, "indexed_images": indexed}
 
+@app.post("/search-by-image")
 @app.post("/api/search-by-image")
 async def search_by_image(file: UploadFile = File(...)):
     if not DB_INDEX:
