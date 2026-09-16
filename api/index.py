@@ -5,7 +5,13 @@ from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from typing import List
 
-app = FastAPI()
+# تخصيص مسارات التوثيق لتكون متوافقة مع توجيه Vercel
+app = FastAPI(
+    title="Visual Search API",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json"
+)
+
 @app.get("/")
 @app.get("/api")
 def read_root():
@@ -13,7 +19,7 @@ def read_root():
         "status": "online",
         "message": "Visual Search API is running successfully!"
     }
-    
+
 JINA_API_KEY = os.getenv("JINA_API_KEY")
 JINA_URL = "https://api.jina.ai/v1/embeddings"
 
