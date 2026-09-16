@@ -5,10 +5,16 @@ from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from typing import List
 
-app = FastAPI(title="Visual Search API")
+app = FastAPI(
+    title="Visual Search API",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
 
 @app.get("/")
 @app.get("/api")
+@app.get("/api/index")
 def read_root():
     return {
         "status": "online",
