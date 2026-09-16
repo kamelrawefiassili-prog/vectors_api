@@ -1,77 +1,87 @@
-import os
-import json
-import base64
-import requests
-from flask import Flask, request, jsonify, make_response
+import express from "express";
+import cors from "cors";
+import axios from "axios";
 
-app = Flask(__name__)
+const app = express();
 
-JINA_API_KEY = os.environ.get("JINA_API_KEY", "YOUR_JINA_API_KEY")
-JINA_URL = "https://api.jina.ai/v1/embeddings"
+// تفعيل CORS لجميع النطاقات وجميع طرق الطلب (GET, POST, OPTIONS) تلقائياً
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
-def build_cors_response(data, status_code=200):
-    """دالة مخصصة لضمان إرفاق ترويسات CORS دائماً حتى في حالات الخطأ"""
-    response = make_response(jsonify(data), status_code)
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    return response
+const JINA_API_KEY = process.env.JINA_API_KEY || "YOUR_JINA_API_KEY";
+const JINA_URL = "https://api.jina.ai/v1/embeddings";
 
-@app.route('/api/get-embedding', methods=['POST', 'OPTIONS'])
-def get_embedding():
-    # 1. المعالجة الفورية لطلبات Preflight الخفيفة من المتصفح
-    if request.method == 'OPTIONS':
-        return build_cors_response({'status': 'ok'}, 200)
+// صفحة الفحص للتحقق من تشغيل السيرفر
+app.get("/", (req, res) => {
+  res.send("✅ Vectors API Proxy is running with Express & CORS!");
+});
 
-    try:
-        req_data = request.get_json(force=True, silent=True) or {}
-        raw_input = req_data.get('image') or req_data.get('url')
+// المسار الرئيسي لاستخراج المتجهات
+app.post("/api/get-embedding", async (req, res) => {
+  try {
+    const { url, image } = req.body;
+    const rawInput = image || url;
 
-        if not raw_input:
-            return build_cors_response({'status': 'error', 'message': 'بيانات أو رابط الصورة مفقود'}, 400)
+    if (!rawInput) {
+      return res.status(400).json({ status: "error", message: "رابط أو بيانات الصورة مفقودة" });
+    }
 
-        image_payload = None
+    let imagePayload;
 
-        # 2. تحديد نوع البيانات الممررة (Base64 أو رابط خارجي)
-        if raw_input.startswith("data:image"):
-            image_payload = {"image": raw_input}
-        else:
-            try:
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-                res = requests.get(raw_input, headers=headers, timeout=12)
-                if res.status_code == 200 and 'image' in res.headers.get('Content-Type', ''):
-                    b64 = base64.b64encode(res.content).decode('utf-8')
-                    mime = res.headers.get('Content-Type', 'image/jpeg')
-                    image_payload = {"image": f"data:{mime};base64,{b64}"}
-                else:
-                    image_payload = {"url": raw_input}
-            except Exception:
-                image_payload = {"url": raw_input}
+    // إذا كانت الصورة ممررة كـ Base64 جاهزة
+    if (rawInput.startsWith("data:image")) {
+      imagePayload = { image: rawInput };
+    } else {
+      // جلب الصورة بواسطة Express وتحويلها إلى Base64 لتجاوز حظر الاستضافة المجانية
+      try {
+        const imgRes = await axios.get(rawInput, {
+          responseType: "arraybuffer",
+          headers: { "User-Agent": "Mozilla/5.0" },
+          timeout: 12000
+        });
+        const contentType = imgRes.headers["content-type"] || "image/jpeg";
+        const base64Str = Buffer.from(imgRes.data, "binary").toString("base64");
+        imagePayload = { image: `data:${contentType};base64,${base64Str}` };
+      } catch (err) {
+        imagePayload = { url: rawInput };
+      }
+    }
 
-        # 3. إرسال الطلب إلى Jina AI
-        jina_headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {JINA_API_KEY}'
-        }
-        jina_payload = {
-            'model': 'jina-clip-v1',
-            'input': [image_payload]
-        }
+    // إرسال الطلب لـ Jina AI
+    const jinaRes = await axios.post(
+      JINA_URL,
+      {
+        model: "jina-clip-v1",
+        input: [imagePayload]
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${JINA_API_KEY}`
+        },
+        timeout: 25000
+      }
+    );
 
-        jina_res = requests.post(JINA_URL, headers=jina_headers, json=jina_payload, timeout=25)
-        jina_json = jina_res.json()
+    if (jinaRes.data && jinaRes.data.data && jinaRes.data.data.length > 0) {
+      return res.json({
+        status: "success",
+        embedding: jinaRes.data.data[0].embedding
+      });
+    } else {
+      return res.status(500).json({
+        status: "error",
+        message: "استجابة غير متوقعة من Jina AI",
+        details: jinaRes.data
+      });
+    }
+  } catch (err) {
+    const errorDetails = err.response ? err.response.data : err.message;
+    return res.status(500).json({
+      status: "error",
+      message: typeof errorDetails === "object" ? JSON.stringify(errorDetails) : errorDetails
+    });
+  }
+});
 
-        if jina_res.status_code == 200 and 'data' in jina_json and len(jina_json['data']) > 0:
-            embedding = jina_json['data'][0]['embedding']
-            return build_cors_response({'status': 'success', 'embedding': embedding})
-        else:
-            return build_cors_response({
-                'status': 'error', 
-                'message': f"خطأ Jina AI ({jina_res.status_code}): {json.dumps(jina_json, ensure_ascii=False)}"
-            }, 500)
-
-    except Exception as e:
-        return build_cors_response({'status': 'error', 'message': f"خطأ غير متوقع في الخادم: {str(e)}"}, 500)
-
-if __name__ == '__main__':
-    app.run()
+export default app;
