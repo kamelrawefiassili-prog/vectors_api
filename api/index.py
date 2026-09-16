@@ -1,25 +1,22 @@
-import express from "express";
-import cors from "cors";
-import axios from "axios";
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
 
 const app = express();
 
-// تفعيل CORS لجميع النطاقات وجميع طرق الطلب (GET, POST, OPTIONS) تلقائياً
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const JINA_API_KEY = process.env.JINA_API_KEY || "YOUR_JINA_API_KEY";
 const JINA_URL = "https://api.jina.ai/v1/embeddings";
 
-// صفحة الفحص للتحقق من تشغيل السيرفر
 app.get("/", (req, res) => {
   res.send("✅ Vectors API Proxy is running with Express & CORS!");
 });
 
-// المسار الرئيسي لاستخراج المتجهات
 app.post("/api/get-embedding", async (req, res) => {
   try {
-    const { url, image } = req.body;
+    const { url, image } = req.body || {};
     const rawInput = image || url;
 
     if (!rawInput) {
@@ -28,11 +25,9 @@ app.post("/api/get-embedding", async (req, res) => {
 
     let imagePayload;
 
-    // إذا كانت الصورة ممررة كـ Base64 جاهزة
     if (rawInput.startsWith("data:image")) {
       imagePayload = { image: rawInput };
     } else {
-      // جلب الصورة بواسطة Express وتحويلها إلى Base64 لتجاوز حظر الاستضافة المجانية
       try {
         const imgRes = await axios.get(rawInput, {
           responseType: "arraybuffer",
@@ -47,7 +42,6 @@ app.post("/api/get-embedding", async (req, res) => {
       }
     }
 
-    // إرسال الطلب لـ Jina AI
     const jinaRes = await axios.post(
       JINA_URL,
       {
@@ -84,4 +78,4 @@ app.post("/api/get-embedding", async (req, res) => {
   }
 });
 
-export default app;
+module.exports = app;
