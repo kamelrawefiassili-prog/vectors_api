@@ -16,8 +16,6 @@ app.get("/", (req, res) => {
   res.send("✅ Vectors API Proxy is running with Express & CORS!");
 });
 
-// Health check for the actual endpoint — lets you verify the deployment
-// (and whether the API key is configured) without sending an image.
 app.get("/api/get-embedding", (req, res) => {
   res.json({
     status: "ok",
@@ -28,9 +26,6 @@ app.get("/api/get-embedding", (req, res) => {
 
 app.post("/api/get-embedding", async (req, res) => {
   try {
-    // Fail loudly and immediately if the API key isn't set, instead of
-    // silently sending a placeholder string to Jina AI and getting a
-    // confusing 401 back later.
     if (!JINA_API_KEY) {
       return res.status(500).json({
         status: "error",
@@ -42,6 +37,12 @@ app.post("/api/get-embedding", async (req, res) => {
     const { url, image } = req.body || {};
     const rawInput = image || url;
 
+    // DEBUG: log exactly what arrived from the client.
+    console.log("[DEBUG] req.body keys:", Object.keys(req.body || {}));
+    console.log("[DEBUG] typeof image:", typeof image, "| length:", image ? image.length : null);
+    console.log("[DEBUG] typeof url:", typeof url, "| value:", url);
+    console.log("[DEBUG] rawInput starts with:", rawInput ? String(rawInput).substring(0, 60) : null);
+
     if (!rawInput) {
       return res.status(400).json({
         status: "error",
@@ -50,14 +51,12 @@ app.post("/api/get-embedding", async (req, res) => {
     }
 
     let imagePayload;
+    let sourceUsed;
 
     if (rawInput.startsWith("data:image")) {
-      // Already a base64 data URL — send as-is.
       imagePayload = { image: rawInput };
+      sourceUsed = "data-url-as-is";
     } else {
-      // Try to fetch the URL server-side and convert to base64 first.
-      // This avoids cases where Jina AI itself can't reach the URL
-      // (blocked, redirected, requires a User-Agent, etc).
       try {
         const imgRes = await axios.get(rawInput, {
           responseType: "arraybuffer",
@@ -67,18 +66,36 @@ app.post("/api/get-embedding", async (req, res) => {
         const contentType = imgRes.headers["content-type"] || "image/jpeg";
         const base64Str = Buffer.from(imgRes.data, "binary").toString("base64");
         imagePayload = { image: `data:${contentType};base64,${base64Str}` };
+        sourceUsed = "fetched-and-converted";
+        console.log("[DEBUG] fetched image, contentType:", contentType, "| base64 length:", base64Str.length);
       } catch (fetchErr) {
-        // Fallback: let Jina AI try to fetch the URL directly itself.
         imagePayload = { url: rawInput };
+        sourceUsed = "fallback-raw-url";
+        console.log("[DEBUG] fetch failed, falling back to raw URL. Error:", fetchErr.message);
       }
     }
 
+    console.log("[DEBUG] sourceUsed:", sourceUsed);
+    console.log("[DEBUG] imagePayload keys:", Object.keys(imagePayload));
+    console.log("[DEBUG] imagePayload.image length:", imagePayload.image ? imagePayload.image.length : null);
+    console.log("[DEBUG] imagePayload.url:", imagePayload.url || null);
+
+    const jinaRequestBody = {
+      model: JINA_MODEL,
+      input: [imagePayload]
+    };
+
+    console.log("[DEBUG] Full body being sent to Jina (image truncated):", JSON.stringify({
+      model: jinaRequestBody.model,
+      input: [{
+        image: imagePayload.image ? imagePayload.image.substring(0, 50) + "...[truncated]" : undefined,
+        url: imagePayload.url || undefined
+      }]
+    }));
+
     const jinaRes = await axios.post(
       JINA_URL,
-      {
-        model: JINA_MODEL,
-        input: [imagePayload]
-      },
+      jinaRequestBody,
       {
         headers: {
           "Content-Type": "application/json",
@@ -102,6 +119,7 @@ app.post("/api/get-embedding", async (req, res) => {
     }
   } catch (err) {
     const errorDetails = err.response ? err.response.data : err.message;
+    console.log("[DEBUG] Error caught:", JSON.stringify(errorDetails));
     return res.status(500).json({
       status: "error",
       message: typeof errorDetails === "object" ? JSON.stringify(errorDetails) : errorDetails
@@ -109,8 +127,6 @@ app.post("/api/get-embedding", async (req, res) => {
   }
 });
 
-// Catch-all 404 so unknown routes return a clear JSON error instead of
-// an opaque platform-level failure.
 app.use((req, res) => {
   res.status(404).json({
     status: "error",
