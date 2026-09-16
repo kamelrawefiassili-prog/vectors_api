@@ -1,10 +1,17 @@
 {
-  "name": "vectors-api",
+  "name": "vectors-api-proxy",
   "version": "1.0.0",
+  "description": "Vercel serverless proxy for Jina AI CLIP embeddings, bridging Awardspace PHP hosting (which blocks outbound cURL to external APIs) with Jina AI's embedding API.",
   "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  },
   "dependencies": {
-    "axios": "^1.6.8",
+    "express": "^4.19.2",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "axios": "^1.7.7"
+  },
+  "engines": {
+    "node": ">=18.x"
   }
 }
