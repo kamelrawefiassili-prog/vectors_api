@@ -1,25 +1,31 @@
 import os
 import requests
 import numpy as np
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from typing import List
 
 app = FastAPI()
 
-HF_TOKEN = os.getenv("HF_TOKEN")
-API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/openai/clip-vit-base-patch32"
-HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+JINA_API_KEY = os.getenv("JINA_API_KEY")
+JINA_URL = "https://api.jina.ai/v1/embeddings"
 
-# ذاكرة مؤقتة للمتجهات (أو يمكن ربطها بـ Qdrant Cloud)
 DB_INDEX = []
 
-def get_clip_embedding(image_bytes: bytes) -> List[float]:
-    """استدعاء Hugging Face للحصول على متجه الصورة"""
-    response = requests.post(API_URL, headers=HEADERS, data=image_bytes)
-    if response.status_code != 200:
-        raise Exception(f"HF API Error: {response.text}")
-    return response.json()
+def get_jina_embedding(image_input: dict) -> List[float]:
+    """استخراج المتجه البصري من Jina AI عبر رابط أو صورة"""
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {JINA_API_KEY}"
+    }
+    payload = {
+        "model": "jina-clip-v1",
+        "input": [image_input]
+    }
+    res = requests.post(JINA_URL, headers=headers, json=payload, timeout=15)
+    if res.status_code == 200:
+        return res.json()["data"][0]["embedding"]
+    raise Exception(f"Jina API Error: {res.text}")
 
 class IndexRequest(BaseModel):
     product_id: str
@@ -28,23 +34,20 @@ class IndexRequest(BaseModel):
 @app.post("/api/index-product")
 async def index_product(req: IndexRequest):
     global DB_INDEX
-    # حذف البيانات القديمة للمنتج
     DB_INDEX = [item for item in DB_INDEX if item["product_id"] != str(req.product_id)]
     
     indexed = 0
     for url in req.image_urls:
         try:
-            img_res = requests.get(url, timeout=10)
-            if img_res.status_code == 200:
-                vec = get_clip_embedding(img_res.content)
-                DB_INDEX.append({
-                    "product_id": str(req.product_id),
-                    "url": url,
-                    "embedding": vec
-                })
-                indexed += 1
+            vec = get_jina_embedding({"url": url})
+            DB_INDEX.append({
+                "product_id": str(req.product_id),
+                "url": url,
+                "embedding": vec
+            })
+            indexed += 1
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Indexing error: {e}")
             
     return {"status": "success", "product_id": req.product_id, "indexed_images": indexed}
 
@@ -54,20 +57,20 @@ async def search_by_image(file: UploadFile = File(...)):
         return {"status": "success", "decision": "no_confident_match", "candidates": []}
         
     img_bytes = await file.read()
-    query_vec = np.array(get_clip_embedding(img_bytes))
+    import base64
+    base64_img = base64.b64encode(img_bytes).decode('utf-8')
     
-    # حساب التشابه
+    query_vec = np.array(get_jina_embedding({"bytes": base64_img}))
+    
     candidates = []
     for item in DB_INDEX:
         db_vec = np.array(item["embedding"])
         sim = float(np.dot(query_vec, db_vec) / (np.linalg.norm(query_vec) * np.linalg.norm(db_vec)))
         candidates.append({"product_id": item["product_id"], "similarity": round(sim, 4)})
         
-    # ترتيب حسب التشابه
     candidates.sort(key=lambda x: x["similarity"], reverse=True)
-    
     top = candidates[0] if candidates else None
-    decision = "matched" if top and top["similarity"] > 0.82 else "no_confident_match"
+    decision = "matched" if top and top["similarity"] > 0.80 else "no_confident_match"
     
     return {
         "status": "success",
