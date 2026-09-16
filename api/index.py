@@ -9,76 +9,69 @@ app = Flask(__name__)
 JINA_API_KEY = os.environ.get("JINA_API_KEY", "YOUR_JINA_API_KEY")
 JINA_URL = "https://api.jina.ai/v1/embeddings"
 
-# 1. تفعيل ترويسات CORS لإتاحة الاتصال من المتصفح
-@app.after_request
-def add_cors_headers(response):
+def build_cors_response(data, status_code=200):
+    """دالة مخصصة لضمان إرفاق ترويسات CORS دائماً حتى في حالات الخطأ"""
+    response = make_response(jsonify(data), status_code)
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
 
-def process_image_to_base64(img_url):
-    """تنزيل الصورة في السيرفر وتحويلها لـ Base64 لتجاوز حظر Jina AI أو الاستضافة"""
-    if not img_url:
-        return None
-    if img_url.startswith("data:image"):
-        return img_url
-    
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        res = requests.get(img_url, headers=headers, timeout=15)
-        if res.status_code == 200:
-            content_type = res.headers.get('Content-Type', 'image/jpeg')
-            if 'image' not in content_type:
-                content_type = 'image/jpeg'
-            b64_data = base64.b64encode(res.content).decode('utf-8')
-            return f"data:{content_type};base64,{b64_data}"
-    except Exception as e:
-        print(f"Error downloading image {img_url}: {e}")
-    
-    return img_url
-
 @app.route('/api/get-embedding', methods=['POST', 'OPTIONS'])
 def get_embedding():
-    # الاستجابة لطلبات Preflight الخفيفة من المتصفح
+    # 1. المعالجة الفورية لطلبات Preflight الخفيفة من المتصفح
     if request.method == 'OPTIONS':
-        return make_response('', 200)
+        return build_cors_response({'status': 'ok'}, 200)
 
     try:
-        data = request.get_json(force=True) or {}
-        raw_image = data.get('image') or data.get('url')
+        req_data = request.get_json(force=True, silent=True) or {}
+        raw_input = req_data.get('image') or req_data.get('url')
 
-        if not raw_image:
-            return jsonify({'status': 'error', 'message': 'بيانات أو رابط الصورة مفقود'}), 400
+        if not raw_input:
+            return build_cors_response({'status': 'error', 'message': 'بيانات أو رابط الصورة مفقود'}, 400)
 
-        # تحويل الصورة إلى Base64 بواسطة Vercel
-        image_data = process_image_to_base64(raw_image)
+        image_payload = None
 
-        payload = {
-            'model': 'jina-clip-v1',
-            'input': [
-                {'image': image_data}
-            ]
-        }
+        # 2. تحديد نوع البيانات الممررة (Base64 أو رابط خارجي)
+        if raw_input.startswith("data:image"):
+            image_payload = {"image": raw_input}
+        else:
+            try:
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                res = requests.get(raw_input, headers=headers, timeout=12)
+                if res.status_code == 200 and 'image' in res.headers.get('Content-Type', ''):
+                    b64 = base64.b64encode(res.content).decode('utf-8')
+                    mime = res.headers.get('Content-Type', 'image/jpeg')
+                    image_payload = {"image": f"data:{mime};base64,{b64}"}
+                else:
+                    image_payload = {"url": raw_input}
+            except Exception:
+                image_payload = {"url": raw_input}
 
-        headers = {
+        # 3. إرسال الطلب إلى Jina AI
+        jina_headers = {
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {JINA_API_KEY}'
         }
+        jina_payload = {
+            'model': 'jina-clip-v1',
+            'input': [image_payload]
+        }
 
-        response = requests.post(JINA_URL, headers=headers, json=payload, timeout=30)
-        res_data = response.json()
+        jina_res = requests.post(JINA_URL, headers=jina_headers, json=jina_payload, timeout=25)
+        jina_json = jina_res.json()
 
-        if response.status_code == 200 and 'data' in res_data and len(res_data['data']) > 0:
-            embedding = res_data['data'][0]['embedding']
-            return jsonify({'status': 'success', 'embedding': embedding})
+        if jina_res.status_code == 200 and 'data' in jina_json and len(jina_json['data']) > 0:
+            embedding = jina_json['data'][0]['embedding']
+            return build_cors_response({'status': 'success', 'embedding': embedding})
         else:
-            return jsonify({'status': 'error', 'message': f"خطأ Jina AI: {json.dumps(res_data, ensure_ascii=False)}"}), 500
+            return build_cors_response({
+                'status': 'error', 
+                'message': f"خطأ Jina AI ({jina_res.status_code}): {json.dumps(jina_json, ensure_ascii=False)}"
+            }, 500)
 
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        return build_cors_response({'status': 'error', 'message': f"خطأ غير متوقع في الخادم: {str(e)}"}, 500)
 
 if __name__ == '__main__':
     app.run()
