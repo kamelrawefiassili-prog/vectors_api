@@ -6,7 +6,14 @@ from pydantic import BaseModel
 from typing import List
 
 app = FastAPI()
-
+@app.get("/")
+@app.get("/api")
+def read_root():
+    return {
+        "status": "online",
+        "message": "Visual Search API is running successfully!"
+    }
+    
 JINA_API_KEY = os.getenv("JINA_API_KEY")
 JINA_URL = "https://api.jina.ai/v1/embeddings"
 
