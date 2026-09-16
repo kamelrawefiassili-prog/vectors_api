@@ -2,10 +2,14 @@ import os
 import base64
 import requests
 import numpy as np
+import urllib3
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
+
+# تعطيل تحذيرات شهادات SSL غير الموثوقة لاستضافات Awardspace المجانية
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI(title="Visual Search API")
 
@@ -21,7 +25,6 @@ JINA_API_KEY = os.getenv("JINA_API_KEY", "")
 JINA_URL = "https://api.jina.ai/v1/embeddings"
 GET_VECTORS_URL = os.getenv("GET_VECTORS_URL", "https://codfroud.atwebpages.com/get-vectors.php")
 
-# هُوية متصفح لتجاوز حظر استضافات Awardspace للبوتات
 CUSTOM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json"
@@ -65,9 +68,9 @@ async def get_embedding(req: EmbeddingRequest):
 @app.post("/api/search-by-image")
 async def search_by_image(file: UploadFile = File(...)):
     try:
-        # جلب المتجهات مع إضافة هُوية المتصفح
+        # verify=False يتجاوز مشكلة شهادة SSL في Awardspace
         try:
-            db_res = requests.get(GET_VECTORS_URL, headers=CUSTOM_HEADERS, timeout=10)
+            db_res = requests.get(GET_VECTORS_URL, headers=CUSTOM_HEADERS, verify=False, timeout=10)
             
             if db_res.status_code != 200:
                 return {
@@ -80,7 +83,7 @@ async def search_by_image(file: UploadFile = File(...)):
         except Exception as parse_err:
             return {
                 "status": "error", 
-                "message": f"Response parse error from Awardspace. Make sure get-vectors.php returns JSON. Details: {str(parse_err)}"
+                "message": f"Response parse error from Awardspace: {str(parse_err)}"
             }
 
         if not db_data:
