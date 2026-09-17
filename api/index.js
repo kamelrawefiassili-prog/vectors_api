@@ -10,7 +10,7 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 const JINA_API_KEY = process.env.JINA_API_KEY;
 const JINA_URL = "https://api.jina.ai/v1/embeddings";
-const JINA_MODEL = "jina-clip-v1";
+const JINA_MODEL = "jina-clip-v2";
 
 app.get("/", (req, res) => {
   res.send("✅ Vectors API Proxy is running with Express & CORS!");
