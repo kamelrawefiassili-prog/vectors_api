@@ -83,10 +83,9 @@ app.post("/api/process-and-crop", async (req, res) => {
       const modalResponse = await axios.get(MODAL_REMOVE_BG_URL, {
         params: { url: image_url },
         responseType: "arraybuffer",
-        // Modal cold starts can be slow on the first request after
-        // idle time — allow a generous timeout rather than failing
-        // fast on what might just be a cold container spinning up.
-        timeout: 60000
+        // Kept under Vercel's 60s function limit, leaving headroom for
+        // the ImgBB upload step that follows in the same request.
+        timeout: 45000
       });
       pngBuffer = Buffer.from(modalResponse.data);
     } catch (modalErr) {
