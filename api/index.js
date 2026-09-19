@@ -44,7 +44,7 @@ async function getBlankReferenceHash() {
   }
   const response = await axios.get(BLANK_REFERENCE_URL, {
     responseType: "arraybuffer",
-    timeout: 15000
+    timeout: 25000
   });
   blankReferenceHashCache = hashBuffer(Buffer.from(response.data));
   return blankReferenceHashCache;
