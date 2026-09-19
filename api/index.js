@@ -276,7 +276,7 @@ app.post("/api/get-embedding", async (req, res) => {
             "User-Agent": "Mozilla/5.0 (compatible; VectorsAPIProxy/1.0)",
             "Accept": "image/*,*/*;q=0.8"
           },
-          timeout: 15000,
+          timeout: 25000,
           maxRedirects: 5
         });
         const contentType = imgRes.headers["content-type"] || "image/jpeg";
