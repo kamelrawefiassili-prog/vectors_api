@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
+const crypto = require("crypto");
 const FormData = require("form-data");
 
 const app = express();
@@ -23,6 +24,31 @@ const MODAL_REMOVE_BG_URL = process.env.MODAL_REMOVE_BG_URL ||
 // (both for indexing and for future re-indexing).
 const IMGBB_API_KEY = process.env.IMGBB_API_KEY;
 const IMGBB_UPLOAD_URL = "https://api.imgbb.com/1/upload";
+
+// A known "blank result" reference image — what Modal/rembg returns
+// when it fails to detect any real foreground (a fully or near-fully
+// transparent PNG). We compare every crop result's hash against this
+// reference; an exact match means the crop genuinely failed, not just
+// "happens to be a small file". Cached in module scope so we only
+// fetch it once per warm container instead of on every request.
+const BLANK_REFERENCE_URL = "https://i.ibb.co/KHXDYqg/26951.png";
+let blankReferenceHashCache = null;
+
+function hashBuffer(buffer) {
+  return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+async function getBlankReferenceHash() {
+  if (blankReferenceHashCache) {
+    return blankReferenceHashCache;
+  }
+  const response = await axios.get(BLANK_REFERENCE_URL, {
+    responseType: "arraybuffer",
+    timeout: 15000
+  });
+  blankReferenceHashCache = hashBuffer(Buffer.from(response.data));
+  return blankReferenceHashCache;
+}
 
 app.get("/", (req, res) => {
   res.send("✅ Vectors API Proxy is running with Express & CORS!");
@@ -77,9 +103,21 @@ app.post("/api/process-and-crop", async (req, res) => {
       });
     }
 
+    // Collected step-by-step log messages, returned to the client so
+    // reindex.php / search.php can display a live, detailed trace of
+    // what happened for this specific image — not just the final
+    // success/fail outcome.
+    const steps = [];
+    function logStep(message) {
+      steps.push({ time: new Date().toISOString(), message: message });
+    }
+
+    logStep(`📥 جلب الصورة الأصلية من: ${image_url}`);
+
     // Step 1: remove background via Modal.
     let pngBuffer;
     try {
+      logStep('✂️ إرسال الصورة إلى Modal لإزالة الخلفية...');
       const modalResponse = await axios.get(MODAL_REMOVE_BG_URL, {
         params: { url: image_url },
         responseType: "arraybuffer",
@@ -88,6 +126,49 @@ app.post("/api/process-and-crop", async (req, res) => {
         timeout: 45000
       });
       pngBuffer = Buffer.from(modalResponse.data);
+      logStep(`📦 تم استلام الناتج من Modal (${pngBuffer.length} بايت).`);
+
+      // A fully (or almost fully) transparent/blank result — which can
+      // happen if rembg fails to detect any foreground subject, or if
+      // the source image itself failed to load correctly — compresses
+      // to a very small PNG. A real product photo with visible content
+      // is essentially never this small. Reject it here with a clear
+      // error rather than silently returning a blank image that looks
+      // like a successful crop.
+      const MIN_VALID_PNG_BYTES = 3000;
+      if (pngBuffer.length < MIN_VALID_PNG_BYTES) {
+        logStep(`❌ الحجم (${pngBuffer.length} بايت) أقل من الحد الأدنى المقبول (${MIN_VALID_PNG_BYTES} بايت).`);
+        return res.status(502).json({
+          status: "error",
+          stage: "background_removal",
+          steps: steps,
+          message: `نتيجة القص فارغة أو شبه فارغة (${pngBuffer.length} بايت) — يبدو أن عملية إزالة الخلفية لم تتعرف على أي محتوى في الصورة.`
+        });
+      }
+
+      // Compare against the known "blank result" reference image via
+      // hash — an exact match means this is definitely the same blank
+      // output Modal/rembg produces on failure, not just a small file.
+      logStep('🔍 مقارنة الناتج مع صورة القص الفاشل المرجعية...');
+      try {
+        const referenceHash = await getBlankReferenceHash();
+        const resultHash = hashBuffer(pngBuffer);
+        if (resultHash === referenceHash) {
+          logStep('❌ الناتج مطابق 100% لصورة القص الفاشل المرجعية — القص فشل فعلياً.');
+          return res.status(502).json({
+            status: "error",
+            stage: "background_removal",
+            steps: steps,
+            message: 'نتيجة القص مطابقة تماماً (100%) لنمط "القص الفاشل" المعروف — لم يتم التعرف على أي منتج في الصورة.'
+          });
+        }
+        logStep('✅ الناتج مختلف عن الصورة المرجعية الفاشلة — يبدو أن القص نجح.');
+      } catch (refErr) {
+        // If we can't fetch/hash the reference image for any reason,
+        // don't block the whole request on it — just log and proceed
+        // with the size check result already validated above.
+        logStep(`⚠️ تعذر تحميل صورة المقارنة المرجعية (${refErr.message}) — تم تخطي هذا الفحص.`);
+      }
     } catch (modalErr) {
       const statusCode = modalErr.response ? modalErr.response.status : null;
       let detail = modalErr.message;
@@ -101,9 +182,12 @@ app.post("/api/process-and-crop", async (req, res) => {
           // response wasn't JSON — keep the generic message
         }
       }
+      logStep(`❌ فشل الاتصال بـ Modal: ${detail}`);
+      logStep(`❌ فشل الاتصال بـ Modal: ${detail}`);
       return res.status(502).json({
         status: "error",
         stage: "background_removal",
+        steps: steps,
         message: `فشل قص الخلفية عبر Modal${statusCode ? ` (HTTP ${statusCode})` : ""}: ${detail}`
       });
     }
@@ -111,6 +195,7 @@ app.post("/api/process-and-crop", async (req, res) => {
     // Step 2: upload the resulting PNG to ImgBB for a permanent URL.
     let hostedUrl;
     try {
+      logStep('⏫ جاري رفع الصورة المقصوصة إلى ImgBB...');
       const base64Png = pngBuffer.toString("base64");
 
       const form = new FormData();
@@ -131,18 +216,24 @@ app.post("/api/process-and-crop", async (req, res) => {
       }
 
       hostedUrl = imgbbResponse.data.data.url;
+      logStep(`✅ تم الرفع بنجاح: ${hostedUrl}`);
     } catch (imgbbErr) {
       const statusCode = imgbbErr.response ? imgbbErr.response.status : null;
+      logStep(`❌ فشل الرفع إلى ImgBB: ${imgbbErr.message}`);
       return res.status(502).json({
         status: "error",
         stage: "imgbb_upload",
+        steps: steps,
         message: `فشل رفع الصورة المقصوصة إلى ImgBB${statusCode ? ` (HTTP ${statusCode})` : ""}: ${imgbbErr.message}`
       });
     }
 
+    logStep('🎉 اكتملت عملية القص والرفع بنجاح.');
+
     return res.json({
       status: "success",
-      cropped_image_url: hostedUrl
+      cropped_image_url: hostedUrl,
+      steps: steps
     });
   } catch (err) {
     const errorDetails = err.response ? err.response.data : err.message;
