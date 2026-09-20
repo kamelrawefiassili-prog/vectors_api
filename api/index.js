@@ -1,7 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
-const crypto = require("crypto");
+const sharp = require("sharp");
 const FormData = require("form-data");
 
 const app = express();
@@ -25,29 +25,36 @@ const MODAL_REMOVE_BG_URL = process.env.MODAL_REMOVE_BG_URL ||
 const IMGBB_API_KEY = process.env.IMGBB_API_KEY;
 const IMGBB_UPLOAD_URL = "https://api.imgbb.com/1/upload";
 
-// A known "blank result" reference image — what Modal/rembg returns
-// when it fails to detect any real foreground (a fully or near-fully
-// transparent PNG). We compare every crop result's hash against this
-// reference; an exact match means the crop genuinely failed, not just
-// "happens to be a small file". Cached in module scope so we only
-// fetch it once per warm container instead of on every request.
-const BLANK_REFERENCE_URL = "https://i.ibb.co/KHXDYqg/26951.png";
-let blankReferenceHashCache = null;
+/**
+ * Inspect a PNG's actual alpha (transparency) channel and compute the
+ * fraction of pixels that are meaningfully visible (alpha above a
+ * small noise threshold). A genuinely blank/failed crop result is
+ * ~100% transparent even when minor compression noise pushes a few
+ * pixels' alpha slightly above zero — a byte-size or exact-hash check
+ * can miss that noise, but reading the real pixel data cannot.
+ * Returns a number from 0 (fully transparent/blank) to 1 (fully opaque).
+ */
+async function getVisiblePixelFraction(pngBuffer) {
+  const { data, info } = await sharp(pngBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
 
-function hashBuffer(buffer) {
-  return crypto.createHash("sha256").update(buffer).digest("hex");
-}
+  const channels = info.channels; // 4 (RGBA) after ensureAlpha()
+  const totalPixels = info.width * info.height;
+  if (totalPixels === 0) return 0;
 
-async function getBlankReferenceHash() {
-  if (blankReferenceHashCache) {
-    return blankReferenceHashCache;
+  const ALPHA_NOISE_THRESHOLD = 10; // out of 255 — ignores faint compression artifacts
+  let visibleCount = 0;
+
+  for (let i = 0; i < data.length; i += channels) {
+    const alpha = data[i + 3];
+    if (alpha > ALPHA_NOISE_THRESHOLD) {
+      visibleCount++;
+    }
   }
-  const response = await axios.get(BLANK_REFERENCE_URL, {
-    responseType: "arraybuffer",
-    timeout: 25000
-  });
-  blankReferenceHashCache = hashBuffer(Buffer.from(response.data));
-  return blankReferenceHashCache;
+
+  return visibleCount / totalPixels;
 }
 
 app.get("/", (req, res) => {
@@ -146,28 +153,40 @@ app.post("/api/process-and-crop", async (req, res) => {
         });
       }
 
-      // Compare against the known "blank result" reference image via
-      // hash — an exact match means this is definitely the same blank
-      // output Modal/rembg produces on failure, not just a small file.
-      logStep('🔍 مقارنة الناتج مع صورة القص الفاشل المرجعية...');
+      // Read the actual pixel data and measure how much of the image
+      // is genuinely visible (non-transparent). This catches blank or
+      // near-blank crop failures reliably, even when minor compression
+      // noise means the file isn't tiny and doesn't byte-for-byte match
+      // any single "known blank" reference image.
+      logStep('🔍 تحليل الصورة على مستوى البكسل للتحقق من وجود محتوى مرئي...');
       try {
-        const referenceHash = await getBlankReferenceHash();
-        const resultHash = hashBuffer(pngBuffer);
-        if (resultHash === referenceHash) {
-          logStep('❌ الناتج مطابق 100% لصورة القص الفاشل المرجعية — القص فشل فعلياً.');
+        const visibleFraction = await getVisiblePixelFraction(pngBuffer);
+        const visiblePercent = Math.round(visibleFraction * 1000) / 10;
+        logStep(`📊 نسبة البكسلات المرئية في الصورة: ${visiblePercent}%.`);
+
+        const MIN_VISIBLE_FRACTION = 0.01; // at least 1% of pixels must be visible
+        if (visibleFraction < MIN_VISIBLE_FRACTION) {
+          logStep(`❌ نسبة المحتوى المرئي (${visiblePercent}%) أقل من الحد الأدنى المقبول (1%) — الصورة شبه فارغة.`);
           return res.status(502).json({
             status: "error",
             stage: "background_removal",
             steps: steps,
-            message: 'نتيجة القص مطابقة تماماً (100%) لنمط "القص الفاشل" المعروف — لم يتم التعرف على أي منتج في الصورة.'
+            message: `نتيجة القص شبه فارغة (نسبة المحتوى المرئي: ${visiblePercent}%) — يبدو أن عملية إزالة الخلفية لم تتعرف على أي محتوى حقيقي في الصورة.`
           });
         }
-        logStep('✅ الناتج مختلف عن الصورة المرجعية الفاشلة — يبدو أن القص نجح.');
-      } catch (refErr) {
-        // If we can't fetch/hash the reference image for any reason,
-        // don't block the whole request on it — just log and proceed
-        // with the size check result already validated above.
-        logStep(`⚠️ تعذر تحميل صورة المقارنة المرجعية (${refErr.message}) — تم تخطي هذا الفحص.`);
+        logStep('✅ تم العثور على محتوى مرئي كافٍ — يبدو أن القص نجح.');
+      } catch (pixelErr) {
+        // If pixel analysis itself fails for any reason (corrupt PNG,
+        // unexpected format), don't silently accept a possibly-blank
+        // result — treat it as a failed crop, matching the caution of
+        // the size check above.
+        logStep(`❌ فشل تحليل البكسلات (${pixelErr.message}) — سيتم اعتبار القص فاشلاً تحسباً.`);
+        return res.status(502).json({
+          status: "error",
+          stage: "background_removal",
+          steps: steps,
+          message: `تعذر التحقق من صحة الصورة الناتجة عن القص: ${pixelErr.message}`
+        });
       }
     } catch (modalErr) {
       const statusCode = modalErr.response ? modalErr.response.status : null;
@@ -276,7 +295,7 @@ app.post("/api/get-embedding", async (req, res) => {
             "User-Agent": "Mozilla/5.0 (compatible; VectorsAPIProxy/1.0)",
             "Accept": "image/*,*/*;q=0.8"
           },
-          timeout: 25000,
+          timeout: 15000,
           maxRedirects: 5
         });
         const contentType = imgRes.headers["content-type"] || "image/jpeg";
