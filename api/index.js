@@ -26,35 +26,64 @@ const IMGBB_API_KEY = process.env.IMGBB_API_KEY;
 const IMGBB_UPLOAD_URL = "https://api.imgbb.com/1/upload";
 
 /**
- * Inspect a PNG's actual alpha (transparency) channel and compute the
- * fraction of pixels that are meaningfully visible (alpha above a
- * small noise threshold). A genuinely blank/failed crop result is
- * ~100% transparent even when minor compression noise pushes a few
- * pixels' alpha slightly above zero — a byte-size or exact-hash check
- * can miss that noise, but reading the real pixel data cannot.
- * Returns a number from 0 (fully transparent/blank) to 1 (fully opaque).
+ * Inspect a PNG's actual alpha (transparency) channel and return:
+ * - visibleFraction: fraction of pixels that are meaningfully visible
+ *   (alpha above a small noise threshold), out of the whole image.
+ * - boundingBoxFraction: fraction of visible pixels relative to their
+ *   own tight bounding box. A real product silhouette fills a
+ *   reasonable portion of its bounding box; scattered compression
+ *   noise across the whole frame produces a huge bounding box (near
+ *   full image) with very few pixels in it, so this ratio stays tiny
+ *   even when visibleFraction alone might pass a lenient threshold.
+ *
+ * A genuinely blank/failed crop result is ~100% transparent even when
+ * minor compression noise pushes a few scattered pixels' alpha
+ * slightly above zero — a byte-size or exact-hash check can miss that
+ * noise, but reading the real pixel data cannot.
  */
-async function getVisiblePixelFraction(pngBuffer) {
+async function analyzeVisibleContent(pngBuffer) {
   const { data, info } = await sharp(pngBuffer)
     .ensureAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
   const channels = info.channels; // 4 (RGBA) after ensureAlpha()
-  const totalPixels = info.width * info.height;
-  if (totalPixels === 0) return 0;
+  const width = info.width;
+  const height = info.height;
+  const totalPixels = width * height;
+  if (totalPixels === 0) {
+    return { visibleFraction: 0, boundingBoxFraction: 0 };
+  }
 
   const ALPHA_NOISE_THRESHOLD = 10; // out of 255 — ignores faint compression artifacts
   let visibleCount = 0;
+  let minX = width, maxX = -1, minY = height, maxY = -1;
 
-  for (let i = 0; i < data.length; i += channels) {
-    const alpha = data[i + 3];
-    if (alpha > ALPHA_NOISE_THRESHOLD) {
-      visibleCount++;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * channels;
+      const alpha = data[idx + 3];
+      if (alpha > ALPHA_NOISE_THRESHOLD) {
+        visibleCount++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
     }
   }
 
-  return visibleCount / totalPixels;
+  const visibleFraction = visibleCount / totalPixels;
+
+  let boundingBoxFraction = 0;
+  if (visibleCount > 0) {
+    const boxWidth = maxX - minX + 1;
+    const boxHeight = maxY - minY + 1;
+    const boxArea = boxWidth * boxHeight;
+    boundingBoxFraction = visibleCount / boxArea;
+  }
+
+  return { visibleFraction, boundingBoxFraction };
 }
 
 app.get("/", (req, res) => {
@@ -154,19 +183,23 @@ app.post("/api/process-and-crop", async (req, res) => {
       }
 
       // Read the actual pixel data and measure how much of the image
-      // is genuinely visible (non-transparent). This catches blank or
-      // near-blank crop failures reliably, even when minor compression
-      // noise means the file isn't tiny and doesn't byte-for-byte match
-      // any single "known blank" reference image.
+      // is genuinely visible (non-transparent), and whether that
+      // visible content is coherent (dense within its own bounding
+      // box) rather than scattered noise spread across the frame.
+      // This catches blank or near-blank crop failures reliably, even
+      // when minor compression noise means the file isn't tiny.
       logStep('🔍 تحليل الصورة على مستوى البكسل للتحقق من وجود محتوى مرئي...');
       try {
-        const visibleFraction = await getVisiblePixelFraction(pngBuffer);
-        const visiblePercent = Math.round(visibleFraction * 1000) / 10;
-        logStep(`📊 نسبة البكسلات المرئية في الصورة: ${visiblePercent}%.`);
+        const analysis = await analyzeVisibleContent(pngBuffer);
+        const visiblePercent = Math.round(analysis.visibleFraction * 1000) / 10;
+        const densityPercent = Math.round(analysis.boundingBoxFraction * 1000) / 10;
+        logStep(`📊 نسبة البكسلات المرئية في الصورة: ${visiblePercent}% — كثافة المحتوى داخل حدوده: ${densityPercent}%.`);
 
-        const MIN_VISIBLE_FRACTION = 0.01; // at least 1% of pixels must be visible
-        if (visibleFraction < MIN_VISIBLE_FRACTION) {
-          logStep(`❌ نسبة المحتوى المرئي (${visiblePercent}%) أقل من الحد الأدنى المقبول (1%) — الصورة شبه فارغة.`);
+        const MIN_VISIBLE_FRACTION = 0.15; // at least 15% of the whole image must be visible
+        const MIN_BOUNDING_BOX_DENSITY = 0.20; // visible pixels must fill at least 20% of their own bounding box (rules out scattered noise across a huge box)
+
+        if (analysis.visibleFraction < MIN_VISIBLE_FRACTION) {
+          logStep(`❌ نسبة المحتوى المرئي (${visiblePercent}%) أقل من الحد الأدنى المقبول (${MIN_VISIBLE_FRACTION * 100}%) — الصورة شبه فارغة.`);
           return res.status(502).json({
             status: "error",
             stage: "background_removal",
@@ -174,7 +207,18 @@ app.post("/api/process-and-crop", async (req, res) => {
             message: `نتيجة القص شبه فارغة (نسبة المحتوى المرئي: ${visiblePercent}%) — يبدو أن عملية إزالة الخلفية لم تتعرف على أي محتوى حقيقي في الصورة.`
           });
         }
-        logStep('✅ تم العثور على محتوى مرئي كافٍ — يبدو أن القص نجح.');
+
+        if (analysis.boundingBoxFraction < MIN_BOUNDING_BOX_DENSITY) {
+          logStep(`❌ كثافة المحتوى (${densityPercent}%) أقل من الحد الأدنى المقبول (${MIN_BOUNDING_BOX_DENSITY * 100}%) — يبدو أنه ضوضاء متناثرة وليس منتجاً حقيقياً.`);
+          return res.status(502).json({
+            status: "error",
+            stage: "background_removal",
+            steps: steps,
+            message: `المحتوى المرئي في نتيجة القص متناثر وغير متماسك (كثافة: ${densityPercent}%) — يبدو أنه ضوضاء وليس منتجاً حقيقياً.`
+          });
+        }
+
+        logStep('✅ تم العثور على محتوى مرئي كافٍ ومتماسك — يبدو أن القص نجح.');
       } catch (pixelErr) {
         // If pixel analysis itself fails for any reason (corrupt PNG,
         // unexpected format), don't silently accept a possibly-blank
